@@ -282,7 +282,7 @@ export default function MaterialRequestsPage() {
                   (r.project_id ? `프로젝트 #${r.project_id}` : `자재요청 #${r.id}`);
 
                 return (
-                  <tr key={r.id} style={{ borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+                  <tr key={r.id} onClick={() => navigate(`/materials/${r.id}`)} style={{ borderTop: "1px solid rgba(255,255,255,0.06)", cursor: "pointer" }}>
                     <td style={{ padding: 12, fontWeight: 700 }}>{title}</td>
                     <td style={{ padding: 12, opacity: 0.9 }}>{r.requested_by_name || "-"}</td>
                     <td style={{ padding: 12 }}>

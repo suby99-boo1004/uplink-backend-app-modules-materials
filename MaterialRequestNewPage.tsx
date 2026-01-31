@@ -129,7 +129,8 @@ function extractMaterialLinesFromEstimateDetail(detail: any): MaterialLine[] {
 
 export default function MaterialRequestNewPage() {
   const navigate = useNavigate();
-  const { user } = useAuth() as any;
+  const auth = (useAuth() as any) ?? null;
+  const user = auth?.user ?? null;
 
   const [mode, setMode] = useState<Mode>("ESTIMATE");
   const [projectName, setProjectName] = useState("");
@@ -143,7 +144,44 @@ export default function MaterialRequestNewPage() {
   const [loadingLines, setLoadingLines] = useState(false);
   const [errorLines, setErrorLines] = useState<string | null>(null);
 
-  // 제품 선택 모달
+  
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  const handleSave = async () => {
+    try {
+      setSaving(true);
+      setSaveError(null);
+
+      // 최소 헤더/라인 payload 구성 (백엔드 스키마에 맞춰 필요시 조정)
+      const payload: any = {
+        memo: mode === "MANUAL" ? projectName : undefined,
+        estimate_id: mode === "ESTIMATE" && estimateId !== "" ? Number(estimateId) : undefined,
+        items: lines.map((ln) => ({
+          source:
+            ln.source === "ESTIMATE" ? "FROM_ESTIMATE" : ln.source === "UPLINK_PRODUCT" ? "FROM_PRODUCT" : "MANUAL_TEXT",
+          product_id: ln.product_id,
+          item_name_snapshot: ln.name,
+          spec_snapshot: ln.spec,
+          unit_snapshot: ln.unit || "EA",
+          qty_requested: Number(ln.qty) || 0,
+          note: ln.note || "",
+        })),
+      };
+
+      // undefined 제거
+      Object.keys(payload).forEach((k) => payload[k] === undefined && delete payload[k]);
+
+      await api(`/api/material-requests`, { method: "POST", body: JSON.stringify(payload) });
+      navigate("/materials");
+    } catch (e: any) {
+      const msg = e?.message ?? "저장에 실패했습니다.";
+      setSaveError(msg);
+    } finally {
+      setSaving(false);
+    }
+  };
+// 제품 선택 모달
   const [productModalOpen, setProductModalOpen] = useState(false);
   const [productKeyword, setProductKeyword] = useState("");
   const [productLoading, setProductLoading] = useState(false);
@@ -354,7 +392,7 @@ export default function MaterialRequestNewPage() {
   function GroupRow({ title }: { title: string }) {
     return (
       <tr>
-        <td colSpan={8} style={{ padding: 10, fontWeight: 900, background: "rgba(255,255,255,0.06)" }}>
+        <td colSpan={5} style={{ padding: 10, fontWeight: 900, background: "rgba(255,255,255,0.06)" }}>
           {title}
         </td>
       </tr>
@@ -559,9 +597,6 @@ export default function MaterialRequestNewPage() {
                 <th style={{ textAlign: "left", padding: 10, fontSize: 12, opacity: 0.85 }}>규격</th>
                 <th style={{ textAlign: "left", padding: 10, fontSize: 12, opacity: 0.85, width: 90 }}>단위</th>
                 <th style={{ textAlign: "right", padding: 10, fontSize: 12, opacity: 0.85, width: 110 }}>요청수량</th>
-                <th style={{ textAlign: "right", padding: 10, fontSize: 12, opacity: 0.85, width: 110 }}>재고수량</th>
-                <th style={{ textAlign: "right", padding: 10, fontSize: 12, opacity: 0.85, width: 110 }}>사용수량</th>
-                <th style={{ textAlign: "center", padding: 10, fontSize: 12, opacity: 0.85, width: 120 }}>준비상황</th>
                 <th style={{ textAlign: "left", padding: 10, fontSize: 12, opacity: 0.85, width: 220 }}>비고</th>
               </tr>
             </thead>
@@ -569,7 +604,7 @@ export default function MaterialRequestNewPage() {
             <tbody>
               {!hasAnyLines && !loadingLines && (
                 <tr>
-                  <td colSpan={8} style={{ padding: 12, opacity: 0.75 }}>
+                  <td colSpan={5} style={{ padding: 12, opacity: 0.75 }}>
                     견적서를 선택하면 재료비(자동 입력)가 표시됩니다. 또는 “업링크 제품 추가 / 수동 추가”로 항목을 넣으세요.
                   </td>
                 </tr>
@@ -606,20 +641,7 @@ export default function MaterialRequestNewPage() {
                       inputMode="decimal"
                       style={{ width: "100%", textAlign: "right", padding: "8px 10px", borderRadius: 10, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(17,24,39,0.7)", color: "white", outline: "none" }}
                     />
-                  </td>
-                  <td style={{ padding: 10, textAlign: "right", opacity: 0.85 }}>{ln.stock_qty ?? "-"}</td>
-                  <td style={{ padding: 10, textAlign: "right", opacity: 0.85 }}>{ln.used_qty ?? "-"}</td>
-                  <td style={{ padding: 10, textAlign: "center" }}>
-                    <select
-                      value={ln.prep_status}
-                      onChange={(e) => updateLine(ln.id, { prep_status: e.target.value as PrepStatus })}
-                      style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid rgba(255,255,255,0.15)", background: "rgba(17,24,39,0.7)", color: "white" }}
-                    >
-                      <option value="PREPARING">준비중</option>
-                      <option value="READY">준비완료</option>
-                    </select>
-                  </td>
-                  <td style={{ padding: 10 }}>
+                  </td>                  <td style={{ padding: 10 }}>
                     <input
                       value={ln.note}
                       onChange={(e) => updateLine(ln.id, { note: e.target.value })}
@@ -644,16 +666,7 @@ export default function MaterialRequestNewPage() {
                   </td>
                   <td style={{ padding: 10 }}>
                     <input value={Number.isFinite(ln.qty) ? String(ln.qty) : "0"} onChange={(e) => updateLine(ln.id, { qty: Number(e.target.value) || 0 })} inputMode="decimal" style={{ width: "100%", textAlign: "right", padding: "8px 10px", borderRadius: 10, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(17,24,39,0.7)", color: "white", outline: "none" }} />
-                  </td>
-                  <td style={{ padding: 10, textAlign: "right", opacity: 0.85 }}>{ln.stock_qty ?? "-"}</td>
-                  <td style={{ padding: 10, textAlign: "right", opacity: 0.85 }}>{ln.used_qty ?? "-"}</td>
-                  <td style={{ padding: 10, textAlign: "center" }}>
-                    <select value={ln.prep_status} onChange={(e) => updateLine(ln.id, { prep_status: e.target.value as PrepStatus })} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid rgba(255,255,255,0.15)", background: "rgba(17,24,39,0.7)", color: "white" }}>
-                      <option value="PREPARING">준비중</option>
-                      <option value="READY">준비완료</option>
-                    </select>
-                  </td>
-                  <td style={{ padding: 10 }}>
+                  </td>                  <td style={{ padding: 10 }}>
                     <input value={ln.note} onChange={(e) => updateLine(ln.id, { note: e.target.value })} placeholder="비고" style={{ width: "100%", padding: "8px 10px", borderRadius: 10, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(17,24,39,0.7)", color: "white", outline: "none" }} />
                   </td>
                 </tr>
@@ -673,16 +686,7 @@ export default function MaterialRequestNewPage() {
                   </td>
                   <td style={{ padding: 10 }}>
                     <input value={Number.isFinite(ln.qty) ? String(ln.qty) : "0"} onChange={(e) => updateLine(ln.id, { qty: Number(e.target.value) || 0 })} placeholder="0" inputMode="decimal" style={{ width: "100%", textAlign: "right", padding: "8px 10px", borderRadius: 10, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(17,24,39,0.7)", color: "white", outline: "none" }} />
-                  </td>
-                  <td style={{ padding: 10, textAlign: "right", opacity: 0.85 }}>{ln.stock_qty ?? "-"}</td>
-                  <td style={{ padding: 10, textAlign: "right", opacity: 0.85 }}>{ln.used_qty ?? "-"}</td>
-                  <td style={{ padding: 10, textAlign: "center" }}>
-                    <select value={ln.prep_status} onChange={(e) => updateLine(ln.id, { prep_status: e.target.value as PrepStatus })} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid rgba(255,255,255,0.15)", background: "rgba(17,24,39,0.7)", color: "white" }}>
-                      <option value="PREPARING">준비중</option>
-                      <option value="READY">준비완료</option>
-                    </select>
-                  </td>
-                  <td style={{ padding: 10 }}>
+                  </td>                  <td style={{ padding: 10 }}>
                     <input value={ln.note} onChange={(e) => updateLine(ln.id, { note: e.target.value })} placeholder="비고" style={{ width: "100%", padding: "8px 10px", borderRadius: 10, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(17,24,39,0.7)", color: "white", outline: "none" }} />
                   </td>
                 </tr>
@@ -823,6 +827,27 @@ export default function MaterialRequestNewPage() {
           </div>
         </div>
       )}
+      {/* 하단 액션 */}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 16 }}>
+        {saveError && <div style={{ marginRight: "auto", color: "#ffb4b4", fontSize: 12 }}>{saveError}</div>}
+        <button
+          type="button"
+          onClick={handleSave}
+          disabled={saving || lines.length === 0}
+          style={{
+            padding: "10px 14px",
+            borderRadius: 12,
+            border: "1px solid rgba(255,255,255,0.18)",
+            background: saving ? "rgba(255,255,255,0.08)" : "rgba(99,102,241,0.9)",
+            color: "white",
+            cursor: saving ? "not-allowed" : "pointer",
+            fontWeight: 700,
+          }}
+        >
+          {saving ? "등록 중…" : "등록 완료"}
+        </button>
+      </div>
     </div>
+
   );
 }

@@ -167,14 +167,21 @@ def create_material_request(
     mr = db.execute(
         text(
             """
+            WITH new_id AS (
+              SELECT nextval('public.material_requests_id_seq') AS id
+            )
             INSERT INTO material_requests (
+              id,
+              request_no,
               project_id, client_id, estimate_id, estimate_revision_id,
               status, requested_by, memo, warehouse_id
             )
-            VALUES (
+            SELECT
+              new_id.id,
+              'MR-' || to_char(NOW(), 'YYYYMMDD') || '-' || lpad(new_id.id::text, 4, '0'),
               :project_id, :client_id, :estimate_id, :estimate_revision_id,
               'DRAFT', :requested_by, :memo, :warehouse_id
-            )
+            FROM new_id
             RETURNING id
             """
         ),
@@ -213,7 +220,7 @@ def create_material_request(
                 )
                 VALUES (
                   :material_request_id,
-                  :product_id,
+                  (SELECT id FROM products WHERE id = :product_id),
                   :estimate_item_id,
                   :item_name_snapshot,
                   :spec_snapshot,

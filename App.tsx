@@ -26,6 +26,7 @@ import EstimateEditPage from "./pages/Estimates/EstimateEditPage";
 // ✅ Materials
 import MaterialRequestsPage from "./pages/Materials/MaterialRequestsPage";
 import MaterialRequestNewPage from "./pages/Materials/MaterialRequestNewPage";
+import MaterialRequestDetailPage from "./pages/Materials/MaterialRequestDetailPage";
 
 // Projects
 import ProjectsPage from "./pages/Projects/ProjectsPage";
@@ -112,6 +113,7 @@ export default function App() {
         {/* ✅ Materials */}
         <Route path="materials" element={<MaterialRequestsPage />} />
         <Route path="materials/new" element={<MaterialRequestNewPage />} />
+        <Route path="materials/:id" element={<MaterialRequestDetailPage />} />
 
         {/* Disabled pages: keep menu, render nothing */}
         <Route path="maintenance" element={<EmptyPage />} />
