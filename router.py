@@ -47,6 +47,49 @@ def _is_admin_or_operator(user: Dict[str, Any]) -> bool:
     return rid in (ROLE_ADMIN_ID, ROLE_OPERATOR_ID)
 
 
+
+def _resolve_product_id_by_snapshot(db: Session, name: str, spec: str) -> Optional[int]:
+    n = (name or "").strip().strip('"').strip("'").strip()
+    s = (spec or "").strip().strip('"').strip("'").strip()
+    if not n:
+        return None
+    name_pat = f"%{n}%"
+    spec_pat = f"%{s}%" if s else ""
+    if s:
+        row = db.execute(
+            text(
+                """
+                SELECT id
+                FROM products
+                WHERE deleted_at IS NULL
+                  AND COALESCE(name,'') ILIKE :name_pat
+                  AND COALESCE(spec,'') ILIKE :spec_pat
+                ORDER BY id ASC
+                LIMIT 1
+                """
+            ),
+            {"name_pat": name_pat, "spec_pat": spec_pat},
+        ).mappings().first()
+        if row and row.get("id") is not None:
+            return int(row["id"])
+    row = db.execute(
+        text(
+            """
+            SELECT id
+            FROM products
+            WHERE deleted_at IS NULL
+              AND COALESCE(name,'') ILIKE :name_pat
+            ORDER BY id ASC
+            LIMIT 1
+            """
+        ),
+        {"name_pat": name_pat},
+    ).mappings().first()
+    if row and row.get("id") is not None:
+        return int(row["id"])
+    return None
+
+
 def require_admin_or_operator(
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
@@ -105,7 +148,7 @@ def list_material_requests(
 
     # year=0이면 그냥 필터 없이 반환(프론트가 기본값으로 현재년 보내면 그때 필터)
     year_filter = ""
-    params: Dict[str, Any] = {"q": f"%{q}%"}
+    params: Dict[str, Any] = {"q": f"%{q}%", "state": state.upper()}
 
     if year and year > 0:
         year_filter = "AND EXTRACT(YEAR FROM mr.created_at) = :year"
@@ -117,12 +160,18 @@ def list_material_requests(
             f"""
             SELECT
               mr.id,
+              mr.request_no,
               mr.project_id,
+              mr.estimate_id,
               COALESCE(mr.memo, '') AS memo,
               mr.status,
               mr.warehouse_id,
               mr.requested_by,
               u.name AS requested_by_name,
+              p.name AS project_name,
+              e.title AS estimate_title,
+              COALESCE(NULLIF(p.name,''), NULLIF(mr.memo,''), NULLIF(e.title,''), NULLIF(mr.request_no,''), CONCAT('자재요청#', mr.id)) AS business_name,
+              (COALESCE(e.business_state, 'ONGOING'::estimate_business_state))::text AS business_state,
               mr.created_at,
               mr.updated_at,
               -- 준비상태(요약): 1개라도 PREPARING 있으면 PREPARING
@@ -137,12 +186,23 @@ def list_material_requests(
               END AS prep_status
             FROM material_requests mr
             LEFT JOIN users u ON u.id = mr.requested_by
+            LEFT JOIN projects p ON p.id = mr.project_id
+            LEFT JOIN estimates e ON e.id = mr.estimate_id
             WHERE 1=1
               {year_filter}
+
+              AND (
+                (:state = 'DONE' AND COALESCE(e.business_state, 'ONGOING'::estimate_business_state) = 'DONE'::estimate_business_state) OR
+                (:state = 'CANCELED' AND COALESCE(e.business_state, 'ONGOING'::estimate_business_state) = 'CANCELED'::estimate_business_state) OR
+                (:state NOT IN ('DONE','CANCELED') AND COALESCE(e.business_state, 'ONGOING'::estimate_business_state) NOT IN ('DONE'::estimate_business_state,'CANCELED'::estimate_business_state))
+              )
               AND (
                 COALESCE(:q, '') = '' OR
                 COALESCE(u.name,'') ILIKE :q OR
-                COALESCE(mr.memo,'') ILIKE :q
+                COALESCE(mr.memo,'') ILIKE :q OR
+                COALESCE(p.name,'') ILIKE :q OR
+                COALESCE(e.title,'') ILIKE :q OR
+                COALESCE(mr.request_no,'') ILIKE :q
               )
             ORDER BY mr.id DESC
             """
@@ -157,9 +217,56 @@ def list_material_requests(
     }
 
 
+def _normalize_item_source(v: Any) -> str:
+    """프론트(source) 값을 DB enum(mr_source) 문자열로 정규화"""
+    s = (str(v) if v is not None else "").strip().upper()
+    if "FROM_ESTIMATE" in s or "ESTIMATE" in s:
+        return "FROM_ESTIMATE"
+    if "FROM_PRODUCT" in s or "UPLINK" in s or "PRODUCT" in s:
+        return "FROM_PRODUCT"
+    if "FROM_DESIGN" in s or "DESIGN" in s:
+        return "FROM_DESIGN"
+    if "MANUAL" in s or "TEXT" in s:
+        return "MANUAL_TEXT"
+    return "MANUAL_TEXT"
+
+def _decide_item_source(it: Any, header_estimate_id: Optional[int]) -> str:
+    """아이템 source를 안전하게 결정.
+    - estimate_item_id가 있으면 FROM_ESTIMATE
+    - product_id가 있으면 FROM_PRODUCT (FK로 NULL이 되더라도 분류 목적 유지)
+    - 그 외는 프론트 source 기반 정규화
+    - 단, 헤더에 estimate_id가 있고 프론트 source가 비어있으면 기본 FROM_ESTIMATE로 간주(견적 기반 생성 호환)
+    """
+    est_item_id = getattr(it, "estimate_item_id", None)
+    try:
+        est_item_id = int(est_item_id) if est_item_id is not None else None
+    except Exception:
+        est_item_id = None
+
+    prod_id = getattr(it, "product_id", None)
+    try:
+        prod_id = int(prod_id) if prod_id is not None else None
+    except Exception:
+        prod_id = None
+
+    if est_item_id and est_item_id > 0:
+        return "FROM_ESTIMATE"
+    if prod_id and prod_id > 0:
+        return "FROM_PRODUCT"
+
+    raw = getattr(it, "source", None)
+    normalized = _normalize_item_source(raw)
+    if header_estimate_id and normalized == "MANUAL_TEXT":
+        # 견적 기반 헤더인데 아이템 source가 비어있으면 견적 항목으로 간주
+        return "FROM_ESTIMATE"
+    return normalized
+
+
 @router.post("")
+
 def create_material_request(
     payload: MRCreateIn,
+    v: int = Query(default=1, description="호환용 버전 파라미터"),
     db: Session = Depends(get_db),
     user: Dict[str, Any] = Depends(require_admin_or_operator),  # 생성은 관리자/운영자만 (정책 원하면 변경 가능)
 ):
@@ -210,6 +317,7 @@ def create_material_request(
                   material_request_id,
                   product_id,
                   estimate_item_id,
+                  source,
                   item_name_snapshot,
                   spec_snapshot,
                   unit_snapshot,
@@ -222,6 +330,7 @@ def create_material_request(
                   :material_request_id,
                   (SELECT id FROM products WHERE id = :product_id),
                   :estimate_item_id,
+                  :source,
                   :item_name_snapshot,
                   :spec_snapshot,
                   :unit_snapshot,
@@ -236,6 +345,7 @@ def create_material_request(
                 "material_request_id": mr_id,
                 "product_id": it.product_id,
                 "estimate_item_id": it.estimate_item_id,
+                "source": _decide_item_source(it, getattr(payload, "estimate_id", None)),
                 "item_name_snapshot": it.item_name_snapshot,
                 "spec_snapshot": it.spec_snapshot,
                 "unit_snapshot": it.unit_snapshot,
@@ -245,7 +355,8 @@ def create_material_request(
         )
 
     db.commit()
-    return {"id": mr_id, "status": "DRAFT"}
+    row = db.execute(text("SELECT id, request_no FROM material_requests WHERE id = :id"), {"id": mr_id}).mappings().first()
+    return {"id": mr_id, "request_no": (row.get("request_no") if row else None), "status": "DRAFT"}
 
 
 @router.get("/{mr_id}")
@@ -262,23 +373,26 @@ def get_material_request_detail(
             """
             SELECT
               mr.id,
+              mr.request_no,
               mr.project_id,
-              mr.client_id,
               mr.estimate_id,
-              mr.estimate_revision_id,
-              mr.status,
               mr.warehouse_id,
+              mr.status,
               mr.requested_by,
               u.name AS requested_by_name,
+              p.name AS project_name,
+              e.title AS estimate_title,
               COALESCE(mr.memo,'') AS memo,
               mr.created_at,
               mr.updated_at
             FROM material_requests mr
             LEFT JOIN users u ON u.id = mr.requested_by
-            WHERE mr.id = :id
+            LEFT JOIN projects p ON p.id = mr.project_id
+            LEFT JOIN estimates e ON e.id = mr.estimate_id
+            WHERE mr.id = :mr_id
             """
         ),
-        {"id": mr_id},
+        {"mr_id": mr_id},
     ).mappings().first()
 
     if not header:
@@ -292,6 +406,7 @@ def get_material_request_detail(
               mri.material_request_id,
               mri.product_id,
               mri.estimate_item_id,
+              mri.source,
               COALESCE(mri.item_name_snapshot,'') AS item_name_snapshot,
               COALESCE(mri.spec_snapshot,'') AS spec_snapshot,
               COALESCE(mri.unit_snapshot,'') AS unit_snapshot,
@@ -307,14 +422,34 @@ def get_material_request_detail(
         {"mr_id": mr_id},
     ).mappings().all()
 
-    # 재고 정보는 관리자/운영자만
-    # inventory 구조: (warehouse_id, product_id) -> qty_on_hand
-    if can_see_sensitive and header.get("warehouse_id"):
-        wh = int(header["warehouse_id"])
-        enriched: List[Dict[str, Any]] = []
-        for r in items:
-            d = dict(r)
-            if d.get("product_id"):
+    items_out: List[Dict[str, Any]] = []
+    wh: Optional[int] = int(header["warehouse_id"]) if header.get("warehouse_id") else None
+
+    for r in items:
+        d = dict(r)
+        qty_on_hand: Optional[float] = None
+
+        pid: Optional[int] = int(d["product_id"]) if d.get("product_id") else None
+
+        if pid is None and d.get("estimate_item_id"):
+            est = db.execute(
+                text(
+                    """
+                    SELECT product_id
+                    FROM estimate_items
+                    WHERE id = :eid
+                    """
+                ),
+                {"eid": int(d["estimate_item_id"])},
+            ).mappings().first()
+            if est and est.get("product_id"):
+                pid = int(est["product_id"])
+
+        if pid is None:
+            pid = _resolve_product_id_by_snapshot(db, d.get("item_name_snapshot", ""), d.get("spec_snapshot", ""))
+
+        if pid is not None:
+            if wh is not None:
                 inv = db.execute(
                     text(
                         """
@@ -323,23 +458,29 @@ def get_material_request_detail(
                         WHERE warehouse_id = :wh AND product_id = :pid
                         """
                     ),
-                    {"wh": wh, "pid": int(d["product_id"])},
+                    {"wh": wh, "pid": pid},
                 ).mappings().first()
-                d["qty_on_hand"] = float(inv["qty_on_hand"]) if inv and inv.get("qty_on_hand") is not None else 0.0
+                qty_on_hand = float(inv["qty_on_hand"]) if inv and inv.get("qty_on_hand") is not None else 0.0
             else:
-                d["qty_on_hand"] = None
-            enriched.append(d)
-        items_out = enriched
-    else:
-        items_out = []
-        for r in items:
-            d = dict(r)
-            d["qty_on_hand"] = None
-            if not can_see_sensitive:
-                d["qty_used"] = None
-            items_out.append(d)
+                inv = db.execute(
+                    text(
+                        """
+                        SELECT COALESCE(SUM(qty_on_hand), 0) AS qty_on_hand
+                        FROM inventory
+                        WHERE product_id = :pid
+                        """
+                    ),
+                    {"pid": pid},
+                ).mappings().first()
+                qty_on_hand = float(inv["qty_on_hand"]) if inv and inv.get("qty_on_hand") is not None else 0.0
 
-    # 전체 준비상태
+        d["qty_on_hand"] = qty_on_hand
+
+        if not can_see_sensitive:
+            d["qty_used"] = None
+
+        items_out.append(d)
+
     prep_status = "READY"
     for r in items:
         if r.get("prep_status") == "PREPARING":
@@ -352,6 +493,7 @@ def get_material_request_detail(
         "prep_status": prep_status,
         "items": items_out,
     }
+
 
 
 @router.put("/{mr_id}")
@@ -436,6 +578,56 @@ def patch_material_request_item(
             "qty_used": payload.qty_used,
         },
     )
+
+    # 준비완료(READY)로 바뀌는 순간: 재고변경수량(현재수량-사용수량)을 inventory.qty_on_hand로 확정 반영
+    # - 대표님 요구사항: 준비완료 클릭 시 재고변경수량이 제품(자재관리) 수량으로 저장
+    if payload.prep_status == "READY":
+        row = db.execute(
+            text(
+                """
+                SELECT
+                  mri.product_id,
+                  mri.qty_used,
+                  mr.warehouse_id
+                FROM material_request_items mri
+                JOIN material_requests mr ON mr.id = mri.material_request_id
+                WHERE mri.id = :id
+                """
+            ),
+            {"id": item_id},
+        ).mappings().first()
+    
+        if row and row.get("product_id") and row.get("warehouse_id"):
+            wh = int(row["warehouse_id"])
+            pid = int(row["product_id"])
+            used = float(row.get("qty_used") or 0)
+    
+            inv = db.execute(
+                text(
+                    """
+                    SELECT qty_on_hand
+                    FROM inventory
+                    WHERE warehouse_id = :wh AND product_id = :pid
+                    """
+                ),
+                {"wh": wh, "pid": pid},
+            ).mappings().first()
+    
+            current_qty = float(inv["qty_on_hand"]) if inv and inv.get("qty_on_hand") is not None else 0.0
+            new_qty = current_qty - used
+    
+            # UPSERT (warehouse_id, product_id) 기준
+            db.execute(
+                text(
+                    """
+                    INSERT INTO inventory (warehouse_id, product_id, qty_on_hand)
+                    VALUES (:wh, :pid, :qty)
+                    ON CONFLICT (warehouse_id, product_id)
+                    DO UPDATE SET qty_on_hand = EXCLUDED.qty_on_hand
+                    """
+                ),
+                {"wh": wh, "pid": pid, "qty": new_qty},
+            )
 
     # qty_used가 바뀌면 DB 트리거가 inventory/stock_movements 반영
     db.commit()
