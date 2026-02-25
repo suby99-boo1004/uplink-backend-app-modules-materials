@@ -561,6 +561,13 @@ def create_material_request(
     user = _get_user(db, user_id)
 
     mr_source_labels = _get_enum_labels(db, 'mr_source')
+    # (지시) 견적서 선택 없이도 등록 가능하지만, '자재요청 건명'은 필수
+    business_name = (body.memo or body.project_name or "").strip()
+    if not business_name:
+        raise HTTPException(status_code=400, detail="자재요청 건명을 넣으세요")
+    body.memo = business_name
+    body.project_name = business_name
+
 
     # 상태는 프로젝트 탭과 동일하게 신규는 진행중
     # 상태/문서번호/필수값은 DB 스키마에 맞춰 안전하게 INSERT
