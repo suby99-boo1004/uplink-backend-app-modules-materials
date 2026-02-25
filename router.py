@@ -53,27 +53,34 @@ _ENUM_LABELS_CACHE: Dict[str, List[str]] = {}
 
 
 def _pick_mr_status_label(mr_status_labels: List[str], desired: str) -> Optional[str]:
-    """프론트 state(ONGOING/DONE/CANCELED)를 DB enum(mr_status) 실제 값으로 매핑"""
+    """프론트 state(ONGOING/DONE/CANCELED)를 DB enum(mr_status) 실제 값으로 매핑
+    - 매핑 실패 시 잘못된 값(예: DONE으로 오인)으로 떨어지지 않도록, 원본 desired를 그대로 쓰도록 한다.
+    """
+    desired_up = (desired or "").strip().upper()
+    if not mr_status_labels:
+        return desired_up or None
+
     labels_up = [x.upper() for x in (mr_status_labels or [])]
 
-    def pick(cands):
+    def pick(cands: List[str]) -> Optional[str]:
         for c in cands:
-            if c.upper() in labels_up:
-                idx = labels_up.index(c.upper())
+            cu = (c or "").upper()
+            if cu in labels_up:
+                idx = labels_up.index(cu)
                 return mr_status_labels[idx]
         return None
 
-    desired = (desired or "").strip().upper()
-    if not mr_status_labels:
-        return desired or None
+    if desired_up == "DONE":
+        # DONE 계열이 없으면 desired를 그대로 반환(결과 0건이 더 안전)
+        return pick(["DONE", "COMPLETE", "COMPLETED", "FINISHED", "CLOSED", "END"]) or desired_up
 
-    if desired == "DONE":
-        return pick(["DONE", "COMPLETE", "COMPLETED", "FINISHED", "CLOSED", "END"]) or pick([labels_up[-1]]) or mr_status_labels[-1]
-    if desired == "CANCELED":
-        return pick(["CANCELED", "CANCELLED", "CANCEL", "ABORT", "ABORTED", "VOID"]) or pick([labels_up[-1]]) or mr_status_labels[-1]
+    if desired_up == "CANCELED":
+        # CANCELED 계열이 없으면 desired를 그대로 반환(결과 0건이 더 안전)
+        return pick(["CANCELED", "CANCELLED", "CANCEL", "ABORT", "ABORTED", "VOID"]) or desired_up
 
     # ONGOING
-    return pick(["ONGOING", "IN_PROGRESS", "PROGRESS", "ACTIVE", "RUNNING", "OPEN", "DRAFT", "NEW"]) or mr_status_labels[0]
+    return pick(["ONGOING", "IN_PROGRESS", "PROGRESS", "ACTIVE", "RUNNING", "OPEN", "DRAFT", "NEW"]) or desired_up
+
 
 def _get_enum_labels(db: Session, type_name: str) -> List[str]:
     """PostgreSQL enum 라벨 목록을 조회합니다. (예: mr_source, mr_status)
@@ -693,7 +700,7 @@ def delete_material_request(
         {"id": mr_id},
     )
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "id": mr_id}
 
 
 @router.post("/{mr_id}/items")
