@@ -774,7 +774,7 @@ def patch_material_request_item(
         db.execute(
             text(
                 """
-                SELECT id, source, qty_requested
+                SELECT id, source, qty_requested, qty_used
                 FROM material_request_items
                 WHERE id = :id AND deleted_at IS NULL
                 """
@@ -789,6 +789,7 @@ def patch_material_request_item(
 
     cur_source_norm = _normalize_source(cur.get("source"), mr_source_labels)
     cur_qty_requested = float(cur.get("qty_requested") or 0)
+    cur_qty_used = None if cur.get("qty_used") is None else float(cur.get("qty_used") or 0)
 
     # qty_used는 재고와 연결되므로 관리자/운영자만
     if "qty_used" in body and not _is_admin_or_operator(user):
@@ -815,6 +816,11 @@ def patch_material_request_item(
         ps = (body.get("prep_status") or "").strip().upper()
         if ps == "READY":
             fields["prep_status"] = "READY"
+            # (READY 확정) 프론트는 prep_status만 보내므로, 사용수량이 비어있으면 요청수량을 사용수량으로 확정한다.
+            # 재고 반영은 DB 트리거(fn_mri_apply_qty_used_delta)가 qty_used 변화(Δ)로 1회만 처리한다.
+            if "qty_used" not in body:
+                if (cur_qty_used is None or cur_qty_used == 0) and cur_qty_requested > 0:
+                    fields["qty_used"] = cur_qty_requested
         elif ps == "CHANGED":
             fields["prep_status"] = "CHANGED"
         else:
