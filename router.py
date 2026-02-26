@@ -173,19 +173,6 @@ def _has_column(db: Session, table: str, column: str, schema: str = "public") ->
     )
     return bool(row)
 
-
-def _pick_mr_title_column(db: Session) -> Optional[str]:
-    """자재요청 '건명(사업명)' 저장 컬럼을 환경에 맞춰 선택한다.
-    우선순위: business_name > project_name > title
-    """
-    for col in ("business_name", "project_name", "title"):
-        try:
-            if _has_column(db, "material_requests", col):
-                return col
-        except Exception:
-            continue
-    return None
-
 def _pick_mr_source_label(mr_source_labels: List[str], logical: str) -> str:
     """논리적 source(ESTIMATE/PRODUCT/MANUAL)를 DB enum(mr_source) 실제 라벨로 안전 매핑
     - PRODUCT는 절대 ESTIMATE 계열로 매핑되지 않도록 방지
@@ -270,8 +257,6 @@ def require_admin_or_operator(
 
     # enum labels (DB 스키마 자동 적응)
     mr_source_labels = _get_enum_labels(db, 'mr_source')
-    title_col = _pick_mr_title_column(db)
-    title_col = _pick_mr_title_column(db)
     prep_status_labels = _get_enum_labels(db, 'mr_item_prep_status')
     mr_status_labels = _get_enum_labels(db, 'mr_status')
     status_value = _pick_mr_status_label(mr_status_labels, 'ONGOING') if mr_status_labels else None
@@ -383,12 +368,6 @@ def list_material_requests(
 
     pinned_expr = "COALESCE(mr.is_pinned, false)" if has_pinned else "false"
 
-    title_col = _pick_mr_title_column(db)
-    if title_col:
-        title_expr = f"COALESCE(NULLIF(mr.{title_col},''), NULLIF(pj.name,''), NULLIF(est.title,''), NULLIF(mr.memo,''), ('자재요청#' || mr.id::text))"
-    else:
-        title_expr = "COALESCE(NULLIF(pj.name,''), NULLIF(est.title,''), NULLIF(mr.memo,''), ('자재요청#' || mr.id::text))"
-
     sql_list = f"""
                 SELECT
                     mr.id,
@@ -401,7 +380,7 @@ def list_material_requests(
                     u.name AS requested_by_name,
                     {('mr.is_pinned,' if has_pinned else 'false AS is_pinned,')}
                     -- 표기용: business_name 우선순위
-                    {title_expr} AS business_name,
+                    COALESCE(NULLIF(pj.name,''), NULLIF(est.title,''), NULLIF(mr.memo,''), ('자재요청#' || mr.id::text)) AS business_name,
                     -- 준비상태(READY/PREPARING/ADDITIONAL)
                     {prep_status_expr} AS prep_status
                 FROM material_requests mr
@@ -445,18 +424,10 @@ def get_material_request_detail(
     # 헤더 전체상태 컬럼(prep_overall_status)이 DB에 존재하는지(환경 호환)
     has_overall_status = _has_column(db, "material_requests", "prep_overall_status")
     has_pinned = _has_column(db, "material_requests", "is_pinned")
-
-    title_col = _pick_mr_title_column(db)
-    if title_col:
-        title_expr = f"COALESCE(NULLIF(mr.{title_col},''), NULLIF(pj.name,''), NULLIF(est.title,''), NULLIF(mr.memo,''), ('자재요청#' || mr.id::text))"
-    else:
-        title_expr = "COALESCE(NULLIF(pj.name,''), NULLIF(est.title,''), NULLIF(mr.memo,''), ('자재요청#' || mr.id::text))"
-
+    has_pinned = _has_column(db, "material_requests", "is_pinned")
     header_sql = f"""
                 SELECT
                     mr.id,
-            mr.project_id,
-            mr.estimate_id,
                     mr.memo,
                     mr.status,
                     mr.warehouse_id,
@@ -465,7 +436,7 @@ def get_material_request_detail(
                     {('mr.is_pinned,' if _has_column(db, "material_requests", "is_pinned") else 'false AS is_pinned,')}
                     {('mr.prep_overall_status,' if has_overall_status else '')}
                     {('mr.prep_completed_at,' if has_overall_status else '')}
-                    {title_expr} AS business_name
+                    COALESCE(NULLIF(pj.name,''), NULLIF(est.title,''), NULLIF(mr.memo,''), ('자재요청#' || mr.id::text)) AS business_name
                 FROM material_requests mr
                 LEFT JOIN users u ON u.id = mr.requested_by AND u.deleted_at IS NULL
                 LEFT JOIN projects pj ON pj.id = mr.project_id AND pj.deleted_at IS NULL
@@ -546,67 +517,6 @@ def get_material_request_detail(
 
 
 
-
-@router.post("/{mr_id}/complete")
-def complete_manual_material_request(
-    mr_id: int,
-    body: Dict[str, Any],
-    db: Session = Depends(get_db),
-    user_id: int = Depends(get_current_user_id),
-) -> Dict[str, Any]:
-    """수동 자재요청(프로젝트/견적서 미연동) 건을 사업완료로 전환한다."""
-    _ = _get_user(db, user_id)  # auth
-
-    row = (
-        db.execute(
-            text(
-                """
-                SELECT id, project_id, estimate_id, status
-                FROM material_requests
-                WHERE id = :id AND deleted_at IS NULL
-                """
-            ),
-            {"id": mr_id},
-        )
-        .mappings()
-        .first()
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="자재요청을 찾을 수 없습니다.")
-
-    # 프로젝트/견적서 연동 건은 여기서 사업완료 처리하지 않음
-    if row.get("project_id") is not None or row.get("estimate_id") is not None:
-        raise HTTPException(status_code=409, detail="견적서/프로젝트 연동 자재요청은 이 경로로 사업완료할 수 없습니다.")
-
-    if not body or not bool(body.get("confirm", False)):
-        raise HTTPException(status_code=400, detail="confirm 값이 필요합니다.")
-
-    mr_status_labels = _get_enum_labels(db, "mr_status")
-    done_value = _pick_mr_status_label(mr_status_labels, "DONE") if mr_status_labels else "DONE"
-
-    has_overall_status = _has_column(db, "material_requests", "prep_overall_status")
-    sets = ["status = :st", "updated_at = NOW()"]
-    params = {"id": mr_id, "st": done_value}
-
-    # 환경에 따라 존재할 수 있는 컬럼은 있으면 함께 업데이트
-    if has_overall_status:
-        sets.append("prep_overall_status = 'READY'")
-        if _has_column(db, "material_requests", "prep_completed_at"):
-            sets.append("prep_completed_at = NOW()")
-
-    db.execute(
-        text(
-            f"""
-            UPDATE material_requests
-            SET {", ".join(sets)}
-            WHERE id = :id AND deleted_at IS NULL
-            """
-        ),
-        params,
-    )
-    db.commit()
-    return {"ok": True, "id": mr_id, "status": done_value}
-
 @router.patch("/{mr_id}")
 def update_material_request(
     mr_id: int,
@@ -614,11 +524,7 @@ def update_material_request(
     db: Session = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ) -> Dict[str, Any]:
-    user = _get_user(db, user_id)  # auth
-
-    # 상단 고정(is_pinned) 변경은 관리자/운영자만
-    if body.is_pinned is not None and not _is_admin_or_operator(user):
-        raise HTTPException(status_code=403, detail="관리자/운영자만 가능합니다.")
+    _ = _get_user(db, user_id)  # auth
 
     # 최소 변경: memo/warehouse_id/is_pinned만 업데이트
     has_pinned = _has_column(db, "material_requests", "is_pinned")
@@ -658,7 +564,7 @@ def update_material_request(
             u.name AS requested_by_name,
             {('mr.prep_overall_status,' if has_overall_status else '')}
             {('mr.prep_completed_at,' if has_overall_status else '')}
-            {title_expr} AS business_name
+            COALESCE(NULLIF(pj.name,''), NULLIF(est.title,''), NULLIF(mr.memo,''), ('자재요청#' || mr.id::text)) AS business_name
         FROM material_requests mr
         LEFT JOIN users u ON u.id = mr.requested_by AND u.deleted_at IS NULL
         LEFT JOIN projects pj ON pj.id = mr.project_id AND pj.deleted_at IS NULL
@@ -686,71 +592,368 @@ def create_material_request(
     body.project_name = business_name
     body.memo = (body.memo or "").strip()
 
-    memo_for_db = (body.memo or "").strip()
-    title_col = _pick_mr_title_column(db)
-    if not title_col:
-        # title 컬럼이 없는 환경: 리스트/상세 표기(business_name)를 위해 memo에 건명을 저장(참고사항은 뒤에 이어붙임)
-        if memo_for_db:
-            memo_for_db = f"[건명] {business_name}\n{memo_for_db}"
-        else:
-            memo_for_db = business_name
-
-
 
     # 상태는 프로젝트 탭과 동일하게 신규는 진행중
-    # INSERT 컬럼을 환경에 맞춰 구성(건명 컬럼이 있으면 저장)
-    mr_cols = [
-        "request_no",
-        "project_id",
-        "client_id",
-        "estimate_id",
-        "estimate_revision_id",
-        "warehouse_id",
-        "memo",
-    ]
-    mr_vals = [
-        "('MR-' || to_char(NOW(), 'YYYYMMDDHH24MISS') || '-' || lpad(((random()*10000)::int)::text, 4, '0'))",
-        ":project_id",
-        ":client_id",
-        ":estimate_id",
-        ":estimate_revision_id",
-        ":warehouse_id",
-        ":memo",
-    ]
-    params_insert_mr_base = {
-        "project_id": body.project_id,
-        "client_id": body.client_id,
-        "estimate_id": body.estimate_id,
-        "estimate_revision_id": body.estimate_revision_id,
-        "warehouse_id": body.warehouse_id,
-        "memo": memo_for_db,
-        "requested_by": user["id"],
-    }
-
-    if title_col:
-        mr_cols.insert(-1, title_col)
-        mr_vals.insert(-1, f":{title_col}")
-        params_insert_mr_base[title_col] = business_name
     # 상태/문서번호/필수값은 DB 스키마에 맞춰 안전하게 INSERT
     if 'mr_status_labels' in locals() and mr_status_labels:
-        sql_insert_mr = f"""
+        sql_insert_mr = """
             INSERT INTO material_requests
-                ({', '.join(mr_cols + ['status', 'requested_by'])})
+                (request_no, project_id, client_id, estimate_id, estimate_revision_id, warehouse_id, memo, status, requested_by)
             VALUES
-                ({', '.join(mr_vals + [':status', ':requested_by'])})
+                (('MR-' || to_char(NOW(), 'YYYYMMDDHH24MISS') || '-' || lpad(((random()*10000)::int)::text, 4, '0')),
+                 :project_id, :client_id, :estimate_id, :estimate_revision_id, :warehouse_id, :memo, :status, :requested_by)
             RETURNING id
         """
-        params_insert_mr = dict(params_insert_mr_base)
-        params_insert_mr['status'] = status_value
+        params_insert_mr = {
+            "project_id": body.project_id,
+            "client_id": body.client_id,
+            "estimate_id": body.estimate_id,
+            "estimate_revision_id": body.estimate_revision_id,
+            "warehouse_id": body.warehouse_id,
+            "memo": (body.memo or "").strip(),
+            "status": status_value,
+            "requested_by": user["id"],
+        }
     else:
         # enum 정보를 못 읽는 환경: status는 DB DEFAULT에 맡김
-        sql_insert_mr = f"""
+        sql_insert_mr = """
             INSERT INTO material_requests
-                ({', '.join(mr_cols + ['requested_by'])})
+                (request_no, project_id, client_id, estimate_id, estimate_revision_id, warehouse_id, memo, requested_by)
             VALUES
-                ({', '.join(mr_vals + [':requested_by'])})
+                (('MR-' || to_char(NOW(), 'YYYYMMDDHH24MISS') || '-' || lpad(((random()*10000)::int)::text, 4, '0')),
+                 :project_id, :client_id, :estimate_id, :estimate_revision_id, :warehouse_id, :memo, :requested_by)
             RETURNING id
         """
-        params_insert_mr = dict(params_insert_mr_base)
+        params_insert_mr = {
+            "project_id": body.project_id,
+            "client_id": body.client_id,
+            "estimate_id": body.estimate_id,
+            "estimate_revision_id": body.estimate_revision_id,
+            "warehouse_id": body.warehouse_id,
+            "memo": (body.memo or "").strip(),
+            "requested_by": user["id"],
+        }
+
+    mr_row = (
+        db.execute(text(sql_insert_mr), params_insert_mr)
+        .mappings()
+        .first()
+    )
+    mr_id = int(mr_row["id"])
+
+    # 아이템 삽입
+    for it in body.items or []:
+        src = _normalize_source(it.source, mr_source_labels)
+        # 수동 추가인데 product_id/estimate_item_id가 없으면 MANUAL로 저장(가능한 라벨로 매핑)
+        if (it.product_id is None or int(it.product_id or 0) == 0) and (it.estimate_item_id is None or int(it.estimate_item_id or 0) == 0):
+            src = _pick_mr_source_label(mr_source_labels, 'MANUAL')
+        # 업링크 제품 추가인데 source가 견적서로 저장되는 것 방지
+        if it.product_id is not None and int(it.product_id or 0) > 0 and (it.estimate_item_id is None or int(it.estimate_item_id or 0) == 0):
+            src = _pick_mr_source_label(mr_source_labels, 'PRODUCT')
+
+        name = (it.item_name_snapshot or "").strip()
+        if not name:
+            continue
+
+        unit = (it.unit_snapshot or "EA").strip() or "EA"
+
+        db.execute(
+            text(
+                """
+                INSERT INTO material_request_items
+                    (material_request_id, source, product_id, estimate_item_id, item_name_snapshot, spec_snapshot, unit_snapshot, qty_requested, qty_used, prep_status, note)
+                VALUES
+                    (:mr_id, :source, :product_id, :estimate_item_id, :name, :spec, :unit, :qty_requested, 0, 'PREPARING', :note)
+                """
+            ),
+            {
+                "mr_id": mr_id,
+                "source": src,
+                "product_id": it.product_id,
+                "estimate_item_id": it.estimate_item_id,
+                "name": name,
+                "spec": (it.spec_snapshot or "").strip(),
+                "unit": unit,
+                "qty_requested": float(it.qty_requested or 0),
+                "note": (it.note or "").strip(),
+            },
+        )
+
+    db.commit()
+    return {"id": mr_id}
 
 
+@router.delete("/{mr_id}")
+def delete_material_request(
+    mr_id: int,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    user = _get_user(db, user_id)
+
+    mr_source_labels = _get_enum_labels(db, 'mr_source')
+    if not _is_admin_or_operator(user):
+        raise HTTPException(status_code=403, detail="관리자/운영자만 가능합니다.")
+
+    # soft delete
+    db.execute(
+        text(
+            """
+            UPDATE material_requests
+            SET deleted_at = NOW()
+            WHERE id = :id AND deleted_at IS NULL
+            """
+        ),
+        {"id": mr_id},
+    )
+    db.execute(
+        text(
+            """
+            UPDATE material_request_items
+            SET deleted_at = NOW()
+            WHERE material_request_id = :id AND deleted_at IS NULL
+            """
+        ),
+        {"id": mr_id},
+    )
+    db.commit()
+    return {"ok": True, "id": mr_id}
+
+
+@router.post("/{mr_id}/items")
+def add_material_request_item(
+    mr_id: int,
+    body: MRItemIn,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    _ = _get_user(db, user_id)
+
+    # 존재 확인
+    exists = (
+        db.execute(
+            text("SELECT id FROM material_requests WHERE id = :id AND deleted_at IS NULL"),
+            {"id": mr_id},
+        )
+        .mappings()
+        .first()
+    )
+    if not exists:
+        raise HTTPException(status_code=404, detail="자재요청을 찾을 수 없습니다.")
+
+    mr_source_labels = _get_enum_labels(db, 'mr_source')
+
+    src = _normalize_source(body.source, mr_source_labels)
+
+    # 수동 추가인데 product_id/estimate_item_id가 없으면 MANUAL로 저장(가능한 라벨로 매핑)
+    if (body.product_id is None or int(body.product_id or 0) == 0) and (body.estimate_item_id is None or int(body.estimate_item_id or 0) == 0):
+        src = _pick_mr_source_label(mr_source_labels, 'MANUAL')
+
+    # 업링크 제품 추가인데 source가 견적서로 저장되는 것 방지
+    if body.product_id is not None and int(body.product_id or 0) > 0 and (body.estimate_item_id is None or int(body.estimate_item_id or 0) == 0):
+        src = _pick_mr_source_label(mr_source_labels, 'PRODUCT')
+    name = (body.item_name_snapshot or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="자재명(item_name_snapshot)은 필수입니다.")
+
+    unit = (body.unit_snapshot or "EA").strip() or "EA"
+
+    row = (
+        db.execute(
+            text(
+                """
+                INSERT INTO material_request_items
+                    (material_request_id, source, product_id, estimate_item_id, item_name_snapshot, spec_snapshot, unit_snapshot, qty_requested, qty_used, prep_status, note)
+                VALUES
+                    (:mr_id, :source, :product_id, :estimate_item_id, :name, :spec, :unit, :qty_requested, 0, 'PREPARING', :note)
+                RETURNING id
+                """
+            ),
+            {
+                "mr_id": mr_id,
+                "source": src,
+                "product_id": body.product_id,
+                "estimate_item_id": body.estimate_item_id,
+                "name": name,
+                "spec": (body.spec_snapshot or "").strip(),
+                "unit": unit,
+                "qty_requested": float(body.qty_requested or 0),
+                "note": (body.note or "").strip(),
+            },
+        )
+        .mappings()
+        .first()
+    )
+
+    db.commit()
+    return {"id": int(row["id"])}
+
+
+@router.patch("/items/{item_id}")
+def patch_material_request_item(
+    item_id: int,
+    body: Dict[str, Any],
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    user = _get_user(db, user_id)
+
+    mr_source_labels = _get_enum_labels(db, 'mr_source')
+
+    # 현재 항목 원본 값 조회(수량변경/견적항목 잠금 판단)
+    cur = (
+        db.execute(
+            text(
+                """
+                SELECT id, source, qty_requested, qty_used
+                FROM material_request_items
+                WHERE id = :id AND deleted_at IS NULL
+                """
+            ),
+            {"id": item_id},
+        )
+        .mappings()
+        .first()
+    )
+    if not cur:
+        raise HTTPException(status_code=404, detail="항목을 찾을 수 없습니다.")
+
+    cur_source_norm = _normalize_source(cur.get("source"), mr_source_labels)
+    cur_qty_requested = float(cur.get("qty_requested") or 0)
+    cur_qty_used = None if cur.get("qty_used") is None else float(cur.get("qty_used") or 0)
+
+    # qty_used는 재고와 연결되므로 관리자/운영자만
+    if "qty_used" in body and not _is_admin_or_operator(user):
+        raise HTTPException(status_code=403, detail="재고/사용수량 수정은 관리자/운영자만 가능합니다.")
+
+    # (지시1) 견적서 재료비(ESTIMATE) 항목은 요청수량 변경 금지
+    if "qty_requested" in body and cur_source_norm == "ESTIMATE":
+        raise HTTPException(status_code=403, detail="견적서 재료비 항목의 요청수량은 변경할 수 없습니다.")
+
+    # 허용 필드만 반영
+    fields: Dict[str, Any] = {}
+    prep_status_labels = _get_enum_labels(db, "mr_item_prep_status")
+
+    # 요청수량 변경(준비중에서만 의미 있음; READY 잠금은 DB 트리거가 처리)
+    if "qty_requested" in body:
+        fields["qty_requested"] = float(body.get("qty_requested") or 0)
+
+    if "qty_used" in body:
+        fields["qty_used"] = float(body.get("qty_used") or 0)
+
+    # 준비상황 직접 변경(READY / PREPARING / CHANGED)
+    # 단, qty_requested 변경으로 CHANGED가 이미 설정되면 덮어쓰지 않음
+    if "prep_status" in body and "prep_status" not in fields:
+        ps = (body.get("prep_status") or "").strip().upper()
+        if ps == "READY":
+            fields["prep_status"] = "READY"
+            # (READY 확정) 프론트는 prep_status만 보내므로, 사용수량이 비어있으면 요청수량을 사용수량으로 확정한다.
+            # 재고 반영은 DB 트리거(fn_mri_apply_qty_used_delta)가 qty_used 변화(Δ)로 1회만 처리한다.
+            if "qty_used" not in body:
+                if (cur_qty_used is None or cur_qty_used == 0) and cur_qty_requested > 0:
+                    fields["qty_used"] = cur_qty_requested
+        elif ps == "CHANGED":
+            fields["prep_status"] = "CHANGED"
+        else:
+            fields["prep_status"] = "PREPARING"
+
+    if "note" in body:
+        fields["note"] = (body.get("note") or "").strip()
+    if not fields:
+        return {"ok": True}
+
+    # 동적 UPDATE
+    set_sql = ", ".join([f"{k} = :{k}" for k in fields.keys()])
+    fields["id"] = item_id
+
+    # qty_used 변경 시 DB 트리거(fn_mri_apply_qty_used_delta)가 창고 기준을 요구하는 환경이 있습니다.
+    # material_requests.warehouse_id 가 NULL이면 500이 나므로, 여기서 기본창고를 자동 세팅합니다.
+    if "qty_used" in fields:
+        mr = (
+            db.execute(
+                text(
+                    "SELECT material_request_id FROM material_request_items WHERE id = :id AND deleted_at IS NULL"
+                ),
+                {"id": item_id},
+            )
+            .mappings()
+            .first()
+        )
+        if mr and mr.get("material_request_id") is not None:
+            mr_id = int(mr["material_request_id"])
+            # warehouse_id가 비어있으면 기본창고 세팅
+            wid = _ensure_default_warehouse_id(db)
+            db.execute(
+                text(
+                    "UPDATE material_requests SET warehouse_id = COALESCE(warehouse_id, :wid) WHERE id = :mr_id"
+                ),
+                {"wid": wid, "mr_id": mr_id},
+            )
+            db.flush()
+
+    try:
+        row = (
+            db.execute(
+                text(
+                    f"""
+                    UPDATE material_request_items
+                    SET {set_sql}
+                    WHERE id = :id AND deleted_at IS NULL
+                    RETURNING id
+                    """
+                ),
+                fields,
+            )
+            .mappings()
+            .first()
+        )
+    except Exception as e:
+        msg = str(e)
+        if "READY 상태" in msg and "수정" in msg:
+            raise HTTPException(status_code=409, detail="준비완료(READY) 상태의 항목은 수정할 수 없습니다. 동일 품목 증감은 라인 추가로 처리하세요.")
+        # DB enum(mr_item_prep_status)에 CHANGED가 없으면 enum 입력 오류가 발생한다.
+        if "invalid input value for enum" in msg and "mr_item_prep_status" in msg and "CHANGED" in msg:
+            raise HTTPException(
+                status_code=409,
+                detail="DB enum mr_item_prep_status에 CHANGED 값이 없습니다. 아래 SQL을 1회 실행 후 재시도하세요.\nALTER TYPE mr_item_prep_status ADD VALUE 'CHANGED';",
+            )
+        raise
+    if not row:
+        raise HTTPException(status_code=404, detail="항목을 찾을 수 없습니다.")
+
+    db.commit()
+    return {"ok": True}
+
+
+@router.delete("/items/{item_id}")
+def delete_material_request_item(
+    item_id: int,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    user = _get_user(db, user_id)
+
+    mr_source_labels = _get_enum_labels(db, 'mr_source')
+    if not _is_admin_or_operator(user):
+        raise HTTPException(status_code=403, detail="삭제는 관리자/운영자만 가능합니다.")
+
+    row = (
+        db.execute(
+            text(
+                """
+                UPDATE material_request_items
+                SET deleted_at = NOW()
+                WHERE id = :id AND deleted_at IS NULL
+                RETURNING id
+                """
+            ),
+            {"id": item_id},
+        )
+        .mappings()
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="항목을 찾을 수 없습니다.")
+
+    db.commit()
+    return {"ok": True}
