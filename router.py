@@ -311,6 +311,7 @@ class MRCreateIn(BaseModel):
 class MRUpdateIn(BaseModel):
     warehouse_id: Optional[int] = None
     memo: Optional[str] = None
+    is_pinned: Optional[bool] = None
 
 
 @router.get("")
@@ -355,6 +356,7 @@ def list_material_requests(
         """
 
     has_overall_status = _has_column(db, "material_requests", "prep_overall_status")
+    has_pinned = _has_column(db, "material_requests", "is_pinned")
 
     prep_status_expr = """CASE
                         WHEN SUM(CASE WHEN COALESCE(mri.prep_status,'PREPARING') = 'READY' THEN 0 ELSE 1 END) = 0
@@ -364,6 +366,8 @@ def list_material_requests(
     if has_overall_status:
         prep_status_expr = f"COALESCE(mr.prep_overall_status::text, {prep_status_expr})"
 
+    pinned_expr = "COALESCE(mr.is_pinned, false)" if has_pinned else "false"
+
     sql_list = f"""
                 SELECT
                     mr.id,
@@ -372,7 +376,9 @@ def list_material_requests(
                     mr.memo,
                     mr.created_at,
                     mr.status,
+                    {pinned_expr} AS is_pinned,
                     u.name AS requested_by_name,
+                    {('mr.is_pinned,' if has_pinned else 'false AS is_pinned,')}
                     -- 표기용: business_name 우선순위
                     COALESCE(NULLIF(pj.name,''), NULLIF(est.title,''), NULLIF(mr.memo,''), ('자재요청#' || mr.id::text)) AS business_name,
                     -- 준비상태(READY/PREPARING/ADDITIONAL)
@@ -417,6 +423,8 @@ def get_material_request_detail(
 
     # 헤더 전체상태 컬럼(prep_overall_status)이 DB에 존재하는지(환경 호환)
     has_overall_status = _has_column(db, "material_requests", "prep_overall_status")
+    has_pinned = _has_column(db, "material_requests", "is_pinned")
+    has_pinned = _has_column(db, "material_requests", "is_pinned")
     header_sql = f"""
                 SELECT
                     mr.id,
@@ -425,6 +433,7 @@ def get_material_request_detail(
                     mr.warehouse_id,
                     mr.created_at,
                     u.name AS requested_by_name,
+                    {('mr.is_pinned,' if _has_column(db, "material_requests", "is_pinned") else 'false AS is_pinned,')}
                     {('mr.prep_overall_status,' if has_overall_status else '')}
                     {('mr.prep_completed_at,' if has_overall_status else '')}
                     COALESCE(NULLIF(pj.name,''), NULLIF(est.title,''), NULLIF(mr.memo,''), ('자재요청#' || mr.id::text)) AS business_name
@@ -517,7 +526,8 @@ def update_material_request(
 ) -> Dict[str, Any]:
     _ = _get_user(db, user_id)  # auth
 
-    # 최소 변경: memo/warehouse_id만 업데이트
+    # 최소 변경: memo/warehouse_id/is_pinned만 업데이트
+    has_pinned = _has_column(db, "material_requests", "is_pinned")
     params: Dict[str, Any] = {"id": mr_id}
     sets = []
     if body.warehouse_id is not None:
@@ -526,6 +536,9 @@ def update_material_request(
     if body.memo is not None:
         sets.append("memo = :memo")
         params["memo"] = (body.memo or "").strip()
+    if body.is_pinned is not None and has_pinned:
+        sets.append("is_pinned = :is_pinned")
+        params["is_pinned"] = bool(body.is_pinned)
 
     if not sets:
         return {"ok": True}
@@ -540,6 +553,7 @@ def update_material_request(
 
     # 최신 헤더 반환(프론트 동기화용)
     has_overall_status = _has_column(db, "material_requests", "prep_overall_status")
+    has_pinned = _has_column(db, "material_requests", "is_pinned")
     header_sql = f"""
         SELECT
             mr.id,
@@ -569,11 +583,14 @@ def create_material_request(
 
     mr_source_labels = _get_enum_labels(db, 'mr_source')
     # (지시) 견적서 선택 없이도 등록 가능하지만, '자재요청 건명'은 필수
-    business_name = (body.memo or body.project_name or "").strip()
+    # ✅ '자재요청 참고사항(memo)'은 신규등록 시 기본값이 비어있어야 하므로,
+    #    건명은 project_name으로만 받고 memo는 사용자가 입력할 때만 저장한다.
+    business_name = (body.project_name or "").strip()
     if not business_name:
-        raise HTTPException(status_code=400, detail="자재요청 건명을 넣으세요")
-    body.memo = business_name
+        raise HTTPException(status_code=400, detail="자재요청 참고사항을 넣으세요")
+
     body.project_name = business_name
+    body.memo = (body.memo or "").strip()
 
 
     # 상태는 프로젝트 탭과 동일하게 신규는 진행중
