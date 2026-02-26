@@ -327,7 +327,7 @@ def list_material_requests(
     - 프로젝트 진행/완료/취소 탭과 동일하게 동작: state로 필터
     - 표시용 business_name: COALESCE(project_name, project.name, memo, estimate.title)
     """
-    _ = _get_user(db, user_id)  # auth
+    user = _get_user(db, user_id)  # auth
 
     st = (state or "ONGOING").strip().upper()
     mr_status_labels = _get_enum_labels(db, 'mr_status')
@@ -524,7 +524,7 @@ def update_material_request(
     db: Session = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ) -> Dict[str, Any]:
-    _ = _get_user(db, user_id)  # auth
+    user = _get_user(db, user_id)  # auth
 
     # 최소 변경: memo/warehouse_id/is_pinned만 업데이트
     has_pinned = _has_column(db, "material_requests", "is_pinned")
@@ -537,6 +537,9 @@ def update_material_request(
         sets.append("memo = :memo")
         params["memo"] = (body.memo or "").strip()
     if body.is_pinned is not None and has_pinned:
+        # 상단 고정 변경 권한: 관리자/운영자(role_id 6,7)만 허용
+        if not _is_admin_or_operator(user):
+            raise HTTPException(status_code=403, detail="상단 고정은 관리자/운영자만 변경할 수 있습니다.")
         sets.append("is_pinned = :is_pinned")
         params["is_pinned"] = bool(body.is_pinned)
 
