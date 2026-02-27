@@ -327,7 +327,7 @@ def list_material_requests(
     - 프로젝트 진행/완료/취소 탭과 동일하게 동작: state로 필터
     - 표시용 business_name: COALESCE(project_name, project.name, memo, estimate.title)
     """
-    user = _get_user(db, user_id)  # auth
+    _ = _get_user(db, user_id)  # auth
 
     st = (state or "ONGOING").strip().upper()
     mr_status_labels = _get_enum_labels(db, 'mr_status')
@@ -428,6 +428,8 @@ def get_material_request_detail(
     header_sql = f"""
                 SELECT
                     mr.id,
+                    mr.project_id,
+                    mr.estimate_id,
                     mr.memo,
                     mr.status,
                     mr.warehouse_id,
@@ -524,7 +526,7 @@ def update_material_request(
     db: Session = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ) -> Dict[str, Any]:
-    user = _get_user(db, user_id)  # auth
+    _ = _get_user(db, user_id)  # auth
 
     # 최소 변경: memo/warehouse_id/is_pinned만 업데이트
     has_pinned = _has_column(db, "material_requests", "is_pinned")
@@ -537,9 +539,6 @@ def update_material_request(
         sets.append("memo = :memo")
         params["memo"] = (body.memo or "").strip()
     if body.is_pinned is not None and has_pinned:
-        # 상단 고정 변경 권한: 관리자/운영자(role_id 6,7)만 허용
-        if not _is_admin_or_operator(user):
-            raise HTTPException(status_code=403, detail="상단 고정은 관리자/운영자만 변경할 수 있습니다.")
         sets.append("is_pinned = :is_pinned")
         params["is_pinned"] = bool(body.is_pinned)
 
@@ -594,6 +593,14 @@ def create_material_request(
 
     body.project_name = business_name
     body.memo = (body.memo or "").strip()
+
+    # (기능) 수동 등록(프로젝트/견적 미연동)일 때는 화면 제목(business_name)이 유지되도록 memo에 건명을 저장
+    # - DB에 별도 title 컬럼이 없으므로, 표기 우선순위(COALESCE ... mr.memo ...)를 이용해 최소 변경으로 해결
+    if (body.project_id is None or int(body.project_id or 0) == 0) and (body.estimate_id is None or int(body.estimate_id or 0) == 0):
+        if body.memo:
+            body.memo = f"{business_name}\n{body.memo}"
+        else:
+            body.memo = business_name
 
 
     # 상태는 프로젝트 탭과 동일하게 신규는 진행중
